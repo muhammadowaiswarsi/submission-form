@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, DragEvent, FormEvent } from "react";
 import { supabase } from "../lib/supabase";
 
@@ -48,7 +48,10 @@ function SubmissionForm() {
   const [items, setItems] = useState<SubmissionRecord[]>([]);
   const [images, setImages] = useState<SubmissionRecord[]>([]);
   const [documents, setDocuments] = useState<SubmissionRecord[]>([]);
-  const [visibleItems, setVisibleItems] = useState<SubmissionRecord[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [currentPage, setCurrentPage] = useState(1);
+  const [itemsPerPage] = useState(8);
+  const [filteredData, setFilteredData] = useState<SubmissionRecord[]>([]);
   const [cardsAnimation, setCardsAnimation] = useState<AnimationState>("enter");
   const [toast, setToast] = useState<ToastState>(null);
   const [fieldErrors, setFieldErrors] = useState<{
@@ -75,15 +78,38 @@ function SubmissionForm() {
 
   useEffect(() => {
     const nextItems = getItemsForFilter(activeFilter, items, images, documents);
+    setFilteredData(filterSubmissionsBySearch(nextItems, searchQuery));
+  }, [activeFilter, items, images, documents, searchQuery]);
 
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [activeFilter, searchQuery]);
+
+  const totalPages = Math.ceil(filteredData.length / itemsPerPage);
+  const paginatedItems = useMemo(() => {
+    const start = (currentPage - 1) * itemsPerPage;
+    return filteredData.slice(start, start + itemsPerPage);
+  }, [filteredData, currentPage, itemsPerPage]);
+
+  const paginationItems = useMemo(
+    () => getPaginationItems(currentPage, totalPages),
+    [currentPage, totalPages],
+  );
+
+  useEffect(() => {
+    if (totalPages > 0 && currentPage > totalPages) {
+      setCurrentPage(totalPages);
+    }
+  }, [currentPage, totalPages]);
+
+  useEffect(() => {
     setCardsAnimation("exit");
     const timeoutId = window.setTimeout(() => {
-      setVisibleItems(nextItems);
       setCardsAnimation("enter");
     }, 180);
 
     return () => window.clearTimeout(timeoutId);
-  }, [activeFilter, items, images, documents]);
+  }, [currentPage, filteredData, activeFilter, searchQuery]);
 
   const resetMessages = () => {
     setFieldErrors({});
@@ -300,29 +326,52 @@ function SubmissionForm() {
         </div>
 
         <div className="filter-tabs" role="tablist" aria-label="File type filters">
-          {[
-            { value: "all", label: "All Types" },
-            { value: "image", label: "Images" },
-            { value: "document", label: "Documents" },
-          ].map((tab) => (
-            <button
-              key={tab.value}
-              className={`filter-tab${activeFilter === tab.value ? " filter-tab--active" : ""}`}
-              type="button"
-              onClick={() => setActiveFilter(tab.value as FilterType)}
-            >
-              {tab.label}
-            </button>
-          ))}
+          <div className="filter-tabs__list">
+            {[
+              { value: "all", label: "All Types" },
+              { value: "image", label: "Images" },
+              { value: "document", label: "Documents" },
+            ].map((tab) => (
+              <button
+                key={tab.value}
+                className={`filter-tab${activeFilter === tab.value ? " filter-tab--active" : ""}`}
+                type="button"
+                onClick={() => setActiveFilter(tab.value as FilterType)}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+
+          <label className="search-input-wrap" htmlFor="file-search">
+            <span className="search-input-wrap__icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none">
+                <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="1.8" />
+                <path d="m20 20-3.2-3.2" stroke="currentColor" strokeWidth="1.8" />
+              </svg>
+            </span>
+            <input
+              id="file-search"
+              className="search-input"
+              type="search"
+              placeholder="Search by identifier or file name"
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+            />
+          </label>
         </div>
 
         <div className={`browse-list browse-list--${cardsAnimation}`}>
-          {visibleItems.length === 0 ? (
+          {paginatedItems.length === 0 ? (
             <div className="empty-state empty-state--wide">
-              {isFetching ? "Loading files..." : "No files found for this filter."}
+              {isFetching
+                ? "Loading files..."
+                : searchQuery.trim()
+                  ? "No files found for this search."
+                  : "No files found for this filter."}
             </div>
           ) : (
-            visibleItems.map((item, index) => (
+            paginatedItems.map((item, index) => (
               <article
                 className="browse-item"
                 key={item.id ?? `${item.file_url}-${index}`}
@@ -345,6 +394,47 @@ function SubmissionForm() {
             ))
           )}
         </div>
+
+        {totalPages > 1 ? (
+          <nav className="pagination" aria-label="Submission pages">
+            <button
+              className="pagination__button"
+              type="button"
+              onClick={() => setCurrentPage((page) => Math.max(1, page - 1))}
+              disabled={currentPage === 1}
+            >
+              Previous
+            </button>
+            <div className="pagination__pages">
+              {paginationItems.map((value, index) =>
+                value === "ellipsis" ? (
+                  <span key={`ellipsis-${index}`} className="pagination__ellipsis">
+                    ...
+                  </span>
+                ) : (
+                  <button
+                    key={value}
+                    className={`pagination__page${
+                      value === currentPage ? " pagination__page--active" : ""
+                    }`}
+                    type="button"
+                    onClick={() => setCurrentPage(value)}
+                  >
+                    {value}
+                  </button>
+                ),
+              )}
+            </div>
+            <button
+              className="pagination__button"
+              type="button"
+              onClick={() => setCurrentPage((page) => Math.min(totalPages, page + 1))}
+              disabled={currentPage === totalPages}
+            >
+              Next
+            </button>
+          </nav>
+        ) : null}
       </section>
 
       {isModalOpen ? (
@@ -523,6 +613,56 @@ function getItemsForFilter(
   }
 
   return items;
+}
+
+function filterSubmissionsBySearch(items: SubmissionRecord[], query: string) {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) {
+    return items;
+  }
+
+  return items.filter((item) => {
+    const fileName = extractFileName(item.file_url).toLowerCase();
+    const typeLabel = item.type.toLowerCase();
+    const pluralType = item.type === "image" ? "images" : "documents";
+
+    return (
+      item.identifier.toLowerCase().includes(normalizedQuery) ||
+      fileName.includes(normalizedQuery) ||
+      typeLabel.includes(normalizedQuery) ||
+      pluralType.includes(normalizedQuery)
+    );
+  });
+}
+
+function getPaginationItems(
+  currentPage: number,
+  totalPages: number,
+): Array<number | "ellipsis"> {
+  if (totalPages <= 7) {
+    return Array.from({ length: totalPages }, (_, index) => index + 1);
+  }
+
+  const pages = [1];
+
+  if (currentPage > 3) {
+    pages.push(-1);
+  }
+
+  const start = Math.max(2, currentPage - 1);
+  const end = Math.min(totalPages - 1, currentPage + 1);
+
+  for (let page = start; page <= end; page += 1) {
+    pages.push(page);
+  }
+
+  if (currentPage < totalPages - 2) {
+    pages.push(-1);
+  }
+
+  pages.push(totalPages);
+
+  return pages.map((value) => (value === -1 ? "ellipsis" : value));
 }
 
 function extractFileName(fileUrl: string) {
