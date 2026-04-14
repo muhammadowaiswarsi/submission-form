@@ -1,4 +1,4 @@
-import SubmissionForm from "../components/SubmissionForm";
+import { SubmissionForm } from "../components/submission";
 
 function Home() {
   return (

@@ -1,68 +1,80 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, DragEvent, FormEvent } from "react";
-import { supabase } from "../lib/supabase";
+import { supabase } from "../../lib/supabase";
+import type { Database } from "../../lib/database.types";
+import { ACCEPTED_FILE_TYPES, BUCKET_NAME, FILTER_TABS, ITEMS_PER_PAGE } from "./constants";
+import { getReadableError, mapErrorToFields } from "./errors";
+import { extractFileName, formatDate, sanitizeFileName } from "./formatters";
+import { useSubmissionsDashboard } from "./hooks/useSubmissionsDashboard";
+import { getPaginationItems } from "./pagination";
+import { extractStorageObjectPath, isStorageObjectMissingError } from "./storage";
+import { fetchIdentifierExistsCaseInsensitive, normalizeSubmissionType } from "./queries";
+import type {
+  AnimationState,
+  FieldErrors,
+  FilterType,
+  SubmissionRecord,
+  SubmissionType,
+  ToastState,
+} from "./types";
 
-type SubmissionType = "image" | "document";
-type FilterType = "all" | SubmissionType;
-type AnimationState = "enter" | "exit";
+type SubmissionInsert = Database["public"]["Tables"]["submissions"]["Insert"];
 
-type SubmissionRecord = {
-  id?: string;
-  identifier: string;
-  type: SubmissionType;
-  file_url: string;
-  status: string;
-  created_at?: string;
-};
-
-type ToastState = {
-  type: "success" | "error";
-  message: string;
-} | null;
-
-const ACCEPTED_FILE_TYPES = [
-  "image/*",
-  ".pdf",
-  ".doc",
-  ".docx",
-  ".txt",
-  ".rtf",
-  ".xls",
-  ".xlsx",
-  ".csv",
-  ".ppt",
-  ".pptx",
-].join(",");
-
-const BUCKET_NAME = import.meta.env.VITE_SUPABASE_BUCKET;
-
-function SubmissionForm() {
+/**
+ * Dashboard + modal upload flow for Supabase-backed file submissions.
+ */
+export default function SubmissionForm() {
   const [identifier, setIdentifier] = useState("");
   const [type, setType] = useState<SubmissionType>("image");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [isFetching, setIsFetching] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [activeFilter, setActiveFilter] = useState<FilterType>("all");
-  const [items, setItems] = useState<SubmissionRecord[]>([]);
-  const [images, setImages] = useState<SubmissionRecord[]>([]);
-  const [documents, setDocuments] = useState<SubmissionRecord[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [currentPage, setCurrentPage] = useState(1);
-  const [itemsPerPage] = useState(8);
-  const [filteredData, setFilteredData] = useState<SubmissionRecord[]>([]);
   const [cardsAnimation, setCardsAnimation] = useState<AnimationState>("enter");
   const [toast, setToast] = useState<ToastState>(null);
-  const [fieldErrors, setFieldErrors] = useState<{
-    identifier?: string;
-    file?: string;
-    general?: string;
-  }>({});
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<SubmissionRecord | null>(null);
+  const [refreshToken, setRefreshToken] = useState(0);
+
+  const bumpRefresh = () => {
+    setRefreshToken((value) => value + 1);
+  };
+
+  const {
+    isFetching,
+    deferredSearchQuery,
+    pageRows,
+    listTotalCount,
+    summaryTotal,
+    summaryImages,
+    summaryDocuments,
+  } = useSubmissionsDashboard({
+    currentPage,
+    activeFilter,
+    searchQuery,
+    refreshToken,
+    setToast,
+    setFieldErrors,
+  });
 
   useEffect(() => {
-    void fetchSubmissions();
-  }, []);
+    if (!pendingDelete) {
+      return undefined;
+    }
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setPendingDelete(null);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [pendingDelete]);
 
   useEffect(() => {
     if (!toast) {
@@ -76,20 +88,7 @@ function SubmissionForm() {
     return () => window.clearTimeout(timeoutId);
   }, [toast]);
 
-  useEffect(() => {
-    const nextItems = getItemsForFilter(activeFilter, items, images, documents);
-    setFilteredData(filterSubmissionsBySearch(nextItems, searchQuery));
-  }, [activeFilter, items, images, documents, searchQuery]);
-
-  useEffect(() => {
-    setCurrentPage(1);
-  }, [activeFilter, searchQuery]);
-
-  const totalPages = Math.ceil(filteredData.length / itemsPerPage);
-  const paginatedItems = useMemo(() => {
-    const start = (currentPage - 1) * itemsPerPage;
-    return filteredData.slice(start, start + itemsPerPage);
-  }, [filteredData, currentPage, itemsPerPage]);
+  const totalPages = listTotalCount === 0 ? 0 : Math.ceil(listTotalCount / ITEMS_PER_PAGE);
 
   const paginationItems = useMemo(
     () => getPaginationItems(currentPage, totalPages),
@@ -109,41 +108,10 @@ function SubmissionForm() {
     }, 180);
 
     return () => window.clearTimeout(timeoutId);
-  }, [currentPage, filteredData, activeFilter, searchQuery]);
+  }, [currentPage, pageRows, activeFilter, deferredSearchQuery]);
 
   const resetMessages = () => {
     setFieldErrors({});
-  };
-
-  const fetchSubmissions = async () => {
-    setIsFetching(true);
-
-    const { data, error } = await supabase
-      .from("submissions")
-      .select("*")
-      .order("created_at", { ascending: false });
-
-    if (error) {
-      setToast({
-        type: "error",
-        message: getReadableError(error.message || "Unable to load submissions."),
-      });
-      setFieldErrors({
-        general: getReadableError(error.message || "Unable to load submissions."),
-      });
-      setIsFetching(false);
-      return;
-    }
-
-    const nextItems = ((data as SubmissionRecord[]) ?? []).map((item): SubmissionRecord => ({
-      ...item,
-      type: item.type === "document" ? "document" : "image",
-    }));
-
-    setItems(nextItems);
-    setImages(nextItems.filter((item) => item.type === "image"));
-    setDocuments(nextItems.filter((item) => item.type === "document"));
-    setIsFetching(false);
   };
 
   const handleFileSelection = (file: File | null) => {
@@ -204,8 +172,28 @@ function SubmissionForm() {
       return;
     }
 
-    if (!identifier.trim()) {
+    const trimmedIdentifier = identifier.trim();
+
+    if (!trimmedIdentifier) {
       setFieldErrors({ identifier: "Please enter an identifier before submitting." });
+      return;
+    }
+
+    const { exists: identifierTaken, error: duplicateCheckError } =
+      await fetchIdentifierExistsCaseInsensitive(trimmedIdentifier);
+
+    if (duplicateCheckError) {
+      setFieldErrors({
+        general: getReadableError(duplicateCheckError.message || "Could not verify identifier."),
+      });
+      return;
+    }
+
+    if (identifierTaken) {
+      setFieldErrors({
+        identifier:
+          "This identifier is already in use. Each submission must use a different identifier.",
+      });
       return;
     }
 
@@ -236,8 +224,8 @@ function SubmissionForm() {
         throw new Error("Could not generate a public URL for the uploaded file.");
       }
 
-      const payload: SubmissionRecord = {
-        identifier: identifier.trim(),
+      const payload: SubmissionInsert = {
+        identifier: trimmedIdentifier,
         type,
         file_url: publicUrl,
         status: "pending",
@@ -251,7 +239,8 @@ function SubmissionForm() {
         );
       }
 
-      await fetchSubmissions();
+      setCurrentPage(1);
+      bumpRefresh();
       resetForm();
       setToast({ type: "success", message: "Submission saved successfully." });
       setIsModalOpen(false);
@@ -269,9 +258,68 @@ function SubmissionForm() {
     }
   };
 
-  const totalCount = items.length;
-  const imageCount = images.length;
-  const documentCount = documents.length;
+  const requestDeleteSubmission = (item: SubmissionRecord) => {
+    if (!item.id) {
+      setToast({ type: "error", message: "This record cannot be deleted because it has no id." });
+      return;
+    }
+    setPendingDelete(item);
+  };
+
+  const cancelPendingDelete = () => {
+    setPendingDelete(null);
+  };
+
+  const performDeleteSubmission = async (item: SubmissionRecord) => {
+    if (!item.id) {
+      return;
+    }
+
+    setDeletingId(item.id);
+
+    try {
+      const { error: deleteRowError } = await supabase.from("submissions").delete().eq("id", item.id);
+
+      if (deleteRowError) {
+        throw new Error(
+          getReadableError(deleteRowError.message || "Could not delete this submission from the database."),
+        );
+      }
+
+      if (BUCKET_NAME) {
+        const objectPath = extractStorageObjectPath(item.file_url, BUCKET_NAME);
+        if (objectPath) {
+          const { error: removeError } = await supabase.storage.from(BUCKET_NAME).remove([objectPath]);
+          if (removeError && !isStorageObjectMissingError(removeError.message)) {
+            setToast({
+              type: "error",
+              message: `Removed from the database, but storage cleanup failed: ${getReadableError(removeError.message)}`,
+            });
+            bumpRefresh();
+            return;
+          }
+        }
+      }
+
+      bumpRefresh();
+      setToast({ type: "success", message: "Submission removed from the database." });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Something went wrong while deleting.";
+      setToast({ type: "error", message });
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const confirmPendingDelete = () => {
+    if (!pendingDelete?.id || deletingId) {
+      return;
+    }
+    const item = pendingDelete;
+    setPendingDelete(null);
+    void performDeleteSubmission(item);
+  };
 
   return (
     <section className="file-dashboard">
@@ -285,27 +333,70 @@ function SubmissionForm() {
         </button>
       </header>
 
-      {toast ? (
-        <div className={`toast toast--${toast.type}`} role="status" aria-live="polite">
-          <span>{toast.message}</span>
-          <button className="toast-close" type="button" onClick={() => setToast(null)}>
-            Close
-          </button>
+      {toast || pendingDelete ? (
+        <div className="toast-stack" aria-live="polite">
+          {toast ? (
+            <div className={`toast toast--${toast.type}`} role="status">
+              <span>{toast.message}</span>
+              <button className="toast-close" type="button" onClick={() => setToast(null)}>
+                Close
+              </button>
+            </div>
+          ) : null}
+          {pendingDelete ? (
+            <div
+              className="toast toast--confirm"
+              role="alertdialog"
+              aria-modal="true"
+              aria-labelledby="delete-confirm-title"
+              aria-describedby="delete-confirm-desc"
+            >
+              <div className="toast-confirm__inner">
+                <p id="delete-confirm-title" className="toast-confirm__title">
+                  Delete this submission?
+                </p>
+                <p id="delete-confirm-desc" className="toast-confirm__desc">
+                  <strong>{pendingDelete.identifier}</strong>{" "}
+                  <span className="toast-confirm__type">
+                    ({normalizeSubmissionType(pendingDelete.type)})
+                  </span>{" "}
+                  will be removed from the database and its file deleted from storage. This cannot be
+                  undone.
+                </p>
+                <div className="toast-confirm__actions">
+                  <button
+                    className="toast-confirm__btn toast-confirm__btn--ghost"
+                    type="button"
+                    onClick={cancelPendingDelete}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    className="toast-confirm__btn toast-confirm__btn--danger"
+                    type="button"
+                    onClick={confirmPendingDelete}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </div>
       ) : null}
 
       <section className="dashboard-summary">
         <div className="summary-card">
           <span>Total Files</span>
-          <strong>{totalCount}</strong>
+          <strong>{summaryTotal}</strong>
         </div>
         <div className="summary-card">
           <span>Images</span>
-          <strong>{imageCount}</strong>
+          <strong>{summaryImages}</strong>
         </div>
         <div className="summary-card">
           <span>Documents</span>
-          <strong>{documentCount}</strong>
+          <strong>{summaryDocuments}</strong>
         </div>
       </section>
 
@@ -318,7 +409,7 @@ function SubmissionForm() {
           <button
             className="ghost-action"
             type="button"
-            onClick={() => void fetchSubmissions()}
+            onClick={() => bumpRefresh()}
             disabled={isFetching}
           >
             {isFetching ? "Refreshing..." : "Refresh"}
@@ -327,16 +418,15 @@ function SubmissionForm() {
 
         <div className="filter-tabs" role="tablist" aria-label="File type filters">
           <div className="filter-tabs__list">
-            {[
-              { value: "all", label: "All Types" },
-              { value: "image", label: "Images" },
-              { value: "document", label: "Documents" },
-            ].map((tab) => (
+            {FILTER_TABS.map((tab) => (
               <button
                 key={tab.value}
                 className={`filter-tab${activeFilter === tab.value ? " filter-tab--active" : ""}`}
                 type="button"
-                onClick={() => setActiveFilter(tab.value as FilterType)}
+                onClick={() => {
+                  setActiveFilter(tab.value);
+                  setCurrentPage(1);
+                }}
               >
                 {tab.label}
               </button>
@@ -354,24 +444,28 @@ function SubmissionForm() {
               id="file-search"
               className="search-input"
               type="search"
-              placeholder="Search by identifier or file name"
+              placeholder="Search..."
               value={searchQuery}
-              onChange={(event) => setSearchQuery(event.target.value)}
+              title="Runs on Supabase (ilike on identifier, file_url, type)"
+              onChange={(event) => {
+                setSearchQuery(event.target.value);
+                setCurrentPage(1);
+              }}
             />
           </label>
         </div>
 
         <div className={`browse-list browse-list--${cardsAnimation}`}>
-          {paginatedItems.length === 0 ? (
+          {pageRows.length === 0 ? (
             <div className="empty-state empty-state--wide">
               {isFetching
                 ? "Loading files..."
-                : searchQuery.trim()
+                : deferredSearchQuery.trim()
                   ? "No files found for this search."
                   : "No files found for this filter."}
             </div>
           ) : (
-            paginatedItems.map((item, index) => (
+            pageRows.map((item, index) => (
               <article
                 className="browse-item"
                 key={item.id ?? `${item.file_url}-${index}`}
@@ -384,11 +478,22 @@ function SubmissionForm() {
                 <div className="browse-item__meta">
                   <div className="browse-item__meta-row">
                     <span className={`pill pill--${item.type}`}>{item.type}</span>
-                    <time>{formatDate(item.created_at, true)}</time>
+                    <time>{formatDate(item.created_at ?? undefined, true)}</time>
                   </div>
-                  <a href={item.file_url} target="_blank" rel="noreferrer">
-                    Open file
-                  </a>
+                  <div className="browse-item__actions">
+                    <a href={item.file_url} target="_blank" rel="noreferrer">
+                      Open file
+                    </a>
+                    <button
+                      className="browse-item__delete"
+                      type="button"
+                      aria-label={`Delete submission ${item.identifier}`}
+                      disabled={!item.id || deletingId === item.id}
+                      onClick={() => requestDeleteSubmission(item)}
+                    >
+                      {deletingId === item.id ? "Deleting…" : "Delete"}
+                    </button>
+                  </div>
                 </div>
               </article>
             ))
@@ -548,148 +653,3 @@ function SubmissionForm() {
     </section>
   );
 }
-
-function sanitizeFileName(fileName: string) {
-  const dotIndex = fileName.lastIndexOf(".");
-  const extension = dotIndex > -1 ? fileName.slice(dotIndex) : "";
-  const baseName = dotIndex > -1 ? fileName.slice(0, dotIndex) : fileName;
-  const safeBaseName = baseName
-    .toLowerCase()
-    .replace(/[^a-z0-9-_]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
-
-  return `${safeBaseName || "file"}${extension.toLowerCase()}`;
-}
-
-function getReadableError(message: string) {
-  const normalizedMessage = message.toLowerCase();
-
-  if (normalizedMessage.includes("invalid key")) {
-    return "This file name contains unsupported characters. Please rename the file or try again.";
-  }
-
-  if (normalizedMessage.includes("row-level security")) {
-    return "You do not have permission to save this record right now. Please check your Supabase table policies.";
-  }
-
-  if (normalizedMessage.includes("duplicate")) {
-    return "A similar record already exists. Please change the identifier and try again.";
-  }
-
-  return message;
-}
-
-function mapErrorToFields(message: string) {
-  const normalizedMessage = message.toLowerCase();
-
-  if (normalizedMessage.includes("identifier")) {
-    return { identifier: message };
-  }
-
-  if (
-    normalizedMessage.includes("file") ||
-    normalizedMessage.includes("upload") ||
-    normalizedMessage.includes("invalid key")
-  ) {
-    return { file: message };
-  }
-
-  return { general: message };
-}
-
-function getItemsForFilter(
-  filter: FilterType,
-  items: SubmissionRecord[],
-  images: SubmissionRecord[],
-  documents: SubmissionRecord[],
-) {
-  if (filter === "image") {
-    return images;
-  }
-
-  if (filter === "document") {
-    return documents;
-  }
-
-  return items;
-}
-
-function filterSubmissionsBySearch(items: SubmissionRecord[], query: string) {
-  const normalizedQuery = query.trim().toLowerCase();
-  if (!normalizedQuery) {
-    return items;
-  }
-
-  return items.filter((item) => {
-    const fileName = extractFileName(item.file_url).toLowerCase();
-    const typeLabel = item.type.toLowerCase();
-    const pluralType = item.type === "image" ? "images" : "documents";
-
-    return (
-      item.identifier.toLowerCase().includes(normalizedQuery) ||
-      fileName.includes(normalizedQuery) ||
-      typeLabel.includes(normalizedQuery) ||
-      pluralType.includes(normalizedQuery)
-    );
-  });
-}
-
-function getPaginationItems(
-  currentPage: number,
-  totalPages: number,
-): Array<number | "ellipsis"> {
-  if (totalPages <= 7) {
-    return Array.from({ length: totalPages }, (_, index) => index + 1);
-  }
-
-  const pages = [1];
-
-  if (currentPage > 3) {
-    pages.push(-1);
-  }
-
-  const start = Math.max(2, currentPage - 1);
-  const end = Math.min(totalPages - 1, currentPage + 1);
-
-  for (let page = start; page <= end; page += 1) {
-    pages.push(page);
-  }
-
-  if (currentPage < totalPages - 2) {
-    pages.push(-1);
-  }
-
-  pages.push(totalPages);
-
-  return pages.map((value) => (value === -1 ? "ellipsis" : value));
-}
-
-function extractFileName(fileUrl: string) {
-  try {
-    const pathname = new URL(fileUrl).pathname;
-    return decodeURIComponent(pathname.split("/").pop() || "Uploaded file");
-  } catch {
-    return "Uploaded file";
-  }
-}
-
-function formatDate(value?: string, withTime = false) {
-  if (!value) {
-    return "Just now";
-  }
-
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "Just now";
-  }
-
-  return new Intl.DateTimeFormat("en-US", {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-    ...(withTime ? { hour: "numeric", minute: "2-digit" } : {}),
-  }).format(date);
-}
-
-export default SubmissionForm;
